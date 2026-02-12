@@ -393,6 +393,12 @@ async def update_streak_and_goal(user_id: int, is_correct: bool) -> str | None:
 #  LLM calls
 # =====================================================================
 
+FREE_MODELS = [
+    "arcee-ai/trinity-large-preview:free",
+    "google/gemma-3-12b-it:free",
+    "google/gemma-3-27b-it:free",
+]
+
 async def generate_chat(messages: list[dict], max_tokens: int = 256, ensure_json: bool = False) -> str:
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -401,30 +407,46 @@ async def generate_chat(messages: list[dict], max_tokens: int = 256, ensure_json
         "HTTP-Referer": "https://in_yaz_bot.local",
         "X-Title": "in_yaz_bot",
     }
-    base_payload = {
-        "model": "google/gemini-2.0-flash-exp:free",
-        "messages": messages,
-        "temperature": 0.15,
-        "max_tokens": max_tokens,
-    }
 
-    payload = dict(base_payload)
-    if ensure_json:
-        payload["response_format"] = {"type": "json_object"}
+    for model in FREE_MODELS:
+        # Gemma models don't support system prompts — move to user
+        if model.startswith("google/gemma") and len(messages) > 1 and messages[0]["role"] == "system":
+            msgs = [{"role": "user", "content": messages[0]["content"] + "\n\n" + messages[1]["content"]}] + messages[2:]
+        else:
+            msgs = messages
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code == 400 and ensure_json:
-                payload = dict(base_payload)
+        payload = {
+            "model": model,
+            "messages": msgs,
+            "temperature": 0.15,
+            "max_tokens": max_tokens,
+        }
+        if ensure_json:
+            payload["response_format"] = {"type": "json_object"}
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            content = (data.get("choices", [{}])[0].get("message") or {}).get("content", "")
-            return content
-    except Exception as e:
-        print("LLM error:", repr(e))
-        return ""
+
+                # If json_object not supported, retry without it
+                if resp.status_code == 400 and ensure_json:
+                    payload.pop("response_format", None)
+                    resp = await client.post(url, json=payload, headers=headers)
+
+                if resp.status_code == 429:
+                    print(f"Rate limited: {model}, trying next...")
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+                content = (data.get("choices", [{}])[0].get("message") or {}).get("content", "")
+                return content
+        except Exception as e:
+            print(f"LLM error ({model}): {repr(e)}")
+            continue
+
+    print("All models failed")
+    return ""
 
 async def judge_semantic(direction: str, question: str, expected: str, user_ans: str) -> tuple[bool, str]:
     messages = [
@@ -1693,6 +1715,31 @@ async def show_statistics(message: Message):
         text += "\n\n" + "\n".join(weekly_lines)
 
     await message.answer(text, reply_markup=MAIN_KB)
+
+# =====================================================================
+#  HANDLERS: Main menu buttons from any state (reset & redirect)
+# =====================================================================
+
+MAIN_MENU_BUTTONS = {BTN_ADD, BTN_DICT, BTN_LEARN, BTN_TRAIN, BTN_SETTINGS, BTN_STATS}
+
+@dp.message(F.text.in_(MAIN_MENU_BUTTONS))
+async def menu_from_any_state(message: Message, state: FSMContext):
+    """Catch main menu button presses when user is stuck in another state."""
+    await state.clear()
+    text = message.text
+
+    if text == BTN_ADD:
+        await enter_learning_mode(message, state)
+    elif text == BTN_DICT:
+        await show_dictionary(message)
+    elif text == BTN_LEARN:
+        await smart_learn_handler(message, state)
+    elif text == BTN_TRAIN:
+        await train_start(message, state)
+    elif text == BTN_SETTINGS:
+        await show_settings(message, state)
+    elif text == BTN_STATS:
+        await show_statistics(message)
 
 # =====================================================================
 #  HANDLERS: AI chat (default state fallback)
