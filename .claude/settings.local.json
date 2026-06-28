@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.\\\\venv\\\\Scripts\\\\python.exe -m pip:*)",
+      "Bash(dir /s \"C:\\\\Users\\\\Lenovo\\\\Documents\\\\in_yaz_bot\")",
+      "WebSearch",
+      "Bash(python -m py_compile:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:openrouter.ai)",
+      "Bash(curl:*)",
+      "Bash(done)"
+    ]
+  }
+}

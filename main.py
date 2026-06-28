@@ -3,13 +3,14 @@ import os
 import re
 import json
 import random
+import sqlite3
 from dotenv import load_dotenv
 from datetime import datetime, date, timedelta, time as dt_time
 from pathlib import Path
 import tempfile
 
 import httpx
-import asyncpg
+import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, StateFilter
@@ -27,19 +28,17 @@ from openai import AsyncOpenAI
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 AI_TOKEN = os.getenv("AI_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_PATH = os.getenv("DB_PATH", "english.db")
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set in .env")
 if not AI_TOKEN:
     raise RuntimeError("AI_TOKEN not set in .env")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set in .env")
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher(storage=MemoryStorage())
 
-pool: asyncpg.Pool | None = None  # type: ignore
+db: aiosqlite.Connection | None = None  # type: ignore
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 openai_client = AsyncOpenAI(api_key=AI_TOKEN, base_url="https://openrouter.ai/api/v1")
 
@@ -333,27 +332,29 @@ def progress_bar(pct: float, length: int = 10) -> str:
     return "▓" * filled + "░" * (length - filled)
 
 async def ensure_user_settings(user_id: int):
-    await pool.execute(  # type: ignore
+    await db.execute(
         """
-        INSERT INTO user_settings (user_id, quiz_enabled, quiz_times, quiz_count, streak, last_practice_date, total_correct, daily_goal, today_answers)
-        VALUES ($1, true, '10:00,14:00,18:00', 5, 0, NULL, 0, 5, 0)
-        ON CONFLICT (user_id) DO NOTHING
+        INSERT OR IGNORE INTO user_settings (user_id, quiz_enabled, quiz_times, quiz_count, streak, last_practice_date, total_correct, daily_goal, today_answers)
+        VALUES (?, 1, '10:00,14:00,18:00', 5, 0, NULL, 0, 5, 0)
         """,
-        user_id
+        (user_id,)
     )
+    await db.commit()
 
 async def update_streak_and_goal(user_id: int, is_correct: bool) -> str | None:
     """Update streak, total_correct, daily goal progress. Returns message if goal reached."""
     await ensure_user_settings(user_id)
     today = date.today()
 
-    settings = await pool.fetchrow(  # type: ignore
-        "SELECT streak, last_practice_date, total_correct, daily_goal, today_answers FROM user_settings WHERE user_id = $1",
-        user_id
+    cursor = await db.execute(
+        "SELECT streak, last_practice_date, total_correct, daily_goal, today_answers FROM user_settings WHERE user_id = ?",
+        (user_id,)
     )
+    settings = await cursor.fetchone()
 
     streak = settings['streak'] or 0
-    last_date = settings['last_practice_date']
+    last_date_str = settings['last_practice_date']
+    last_date = date.fromisoformat(last_date_str) if last_date_str else None
     total_correct = settings['total_correct'] or 0
     daily_goal = settings['daily_goal'] or 5
     today_answers = settings['today_answers'] or 0
@@ -369,20 +370,22 @@ async def update_streak_and_goal(user_id: int, is_correct: bool) -> str | None:
         else:
             streak = 1
 
-        await pool.execute(  # type: ignore
+        await db.execute(
             """
             UPDATE user_settings
-            SET streak = $2, last_practice_date = $3, total_correct = $4, today_answers = $5
-            WHERE user_id = $1
+            SET streak = ?, last_practice_date = ?, total_correct = ?, today_answers = ?
+            WHERE user_id = ?
             """,
-            user_id, streak, today, total_correct, today_answers
+            (streak, today.isoformat(), total_correct, today_answers, user_id)
         )
+        await db.commit()
     else:
         today_answers += 1
-        await pool.execute(  # type: ignore
-            "UPDATE user_settings SET total_correct = $2, today_answers = $3 WHERE user_id = $1",
-            user_id, total_correct, today_answers
+        await db.execute(
+            "UPDATE user_settings SET total_correct = ?, today_answers = ? WHERE user_id = ?",
+            (total_correct, today_answers, user_id)
         )
+        await db.commit()
 
     # Check if daily goal just reached
     if today_answers == daily_goal:
@@ -558,10 +561,11 @@ async def transcribe_voice(voice_file_path: str) -> str:
 async def send_morning_word(user_id: int):
     """Send word of the day from user's vocabulary."""
     try:
-        row = await pool.fetchrow(  # type: ignore
-            "SELECT english, translation FROM vocabulary WHERE user_id = $1 ORDER BY random() LIMIT 1",
-            user_id
+        cursor = await db.execute(
+            "SELECT english, translation FROM vocabulary WHERE user_id = ? ORDER BY random() LIMIT 1",
+            (user_id,)
         )
+        row = await cursor.fetchone()
         if not row:
             return
 
@@ -584,21 +588,24 @@ async def send_morning_word(user_id: int):
 async def send_evening_reminder(user_id: int):
     """Remind user if they haven't practiced today."""
     try:
-        settings = await pool.fetchrow(  # type: ignore
-            "SELECT last_practice_date, streak FROM user_settings WHERE user_id = $1",
-            user_id
+        cursor = await db.execute(
+            "SELECT last_practice_date, streak FROM user_settings WHERE user_id = ?",
+            (user_id,)
         )
+        settings = await cursor.fetchone()
         if not settings:
             return
 
         today = date.today()
-        if settings['last_practice_date'] == today:
+        if settings['last_practice_date'] == today.isoformat():
             return  # already practiced
 
-        due_count = await pool.fetchval(  # type: ignore
-            "SELECT COUNT(*) FROM vocabulary WHERE user_id = $1 AND sr_next_review <= now()",
-            user_id
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM vocabulary WHERE user_id = ? AND sr_next_review <= datetime('now')",
+            (user_id,)
         )
+        row = await cursor.fetchone()
+        due_count = row[0] if row else 0
 
         streak = settings['streak'] or 0
         text = f"{due_count} слов к повторению"
@@ -617,9 +624,10 @@ async def send_evening_reminder(user_id: int):
 
 async def send_morning_to_all():
     try:
-        users = await pool.fetch(  # type: ignore
-            "SELECT DISTINCT user_id FROM user_settings WHERE quiz_enabled = true"
+        cursor = await db.execute(
+            "SELECT DISTINCT user_id FROM user_settings WHERE quiz_enabled = 1"
         )
+        users = await cursor.fetchall()
         for u in users:
             await send_morning_word(u['user_id'])
     except Exception as e:
@@ -627,9 +635,10 @@ async def send_morning_to_all():
 
 async def send_evening_to_all():
     try:
-        users = await pool.fetch(  # type: ignore
-            "SELECT DISTINCT user_id FROM user_settings WHERE quiz_enabled = true"
+        cursor = await db.execute(
+            "SELECT DISTINCT user_id FROM user_settings WHERE quiz_enabled = 1"
         )
+        users = await cursor.fetchall()
         for u in users:
             await send_evening_reminder(u['user_id'])
     except Exception as e:
@@ -641,19 +650,21 @@ async def send_evening_to_all():
 
 async def send_auto_quiz_to_user(user_id: int):
     try:
-        settings = await pool.fetch(  # type: ignore
-            "SELECT quiz_count FROM user_settings WHERE user_id = $1", user_id
+        cursor = await db.execute(
+            "SELECT quiz_count FROM user_settings WHERE user_id = ?", (user_id,)
         )
+        settings = await cursor.fetchall()
         quiz_count = settings[0]['quiz_count'] if settings else 5
 
-        rows = await pool.fetch(  # type: ignore
-            "SELECT id, english, translation FROM vocabulary WHERE user_id = $1 ORDER BY random() LIMIT $2",
-            user_id, quiz_count
+        cursor = await db.execute(
+            "SELECT id, english, translation FROM vocabulary WHERE user_id = ? ORDER BY random() LIMIT ?",
+            (user_id, quiz_count)
         )
+        rows = await cursor.fetchall()
         if not rows:
             return
 
-        await pool.execute("DELETE FROM active_quizzes WHERE user_id = $1", user_id)  # type: ignore
+        await db.execute("DELETE FROM active_quizzes WHERE user_id = ?", (user_id,))
 
         for r in rows:
             direction = random.choice(["en_ru", "ru_en"])
@@ -664,14 +675,17 @@ async def send_auto_quiz_to_user(user_id: int):
                 question = f"Переведи на английский: *{r['translation']}*"
                 expected = r['english']
 
-            await pool.execute(  # type: ignore
-                "INSERT INTO active_quizzes (user_id, question, expected_answer, direction, word_id) VALUES ($1,$2,$3,$4,$5)",
-                user_id, question, expected, direction, r['id']
+            await db.execute(
+                "INSERT INTO active_quizzes (user_id, question, expected_answer, direction, word_id) VALUES (?,?,?,?,?)",
+                (user_id, question, expected, direction, r['id'])
             )
 
-        first_quiz = await pool.fetchrow(  # type: ignore
-            "SELECT id, question FROM active_quizzes WHERE user_id = $1 ORDER BY id LIMIT 1", user_id
+        await db.commit()
+
+        cursor = await db.execute(
+            "SELECT id, question FROM active_quizzes WHERE user_id = ? ORDER BY id LIMIT 1", (user_id,)
         )
+        first_quiz = await cursor.fetchone()
         if first_quiz:
             await bot.send_message(
                 user_id,
@@ -686,9 +700,10 @@ async def send_auto_quiz_to_user(user_id: int):
 
 async def schedule_quizzes_for_all_users():
     try:
-        users = await pool.fetch(  # type: ignore
-            "SELECT DISTINCT user_id FROM user_settings WHERE quiz_enabled = true"
+        cursor = await db.execute(
+            "SELECT DISTINCT user_id FROM user_settings WHERE quiz_enabled = 1"
         )
+        users = await cursor.fetchall()
         for user in users:
             await send_auto_quiz_to_user(user['user_id'])
     except Exception as e:
@@ -781,10 +796,11 @@ async def add_word_process(message: Message, state: FSMContext):
             eng, rus = left, right
 
         try:
-            await pool.execute(  # type: ignore
-                "INSERT INTO vocabulary (user_id, english, translation) VALUES($1, $2, $3)",
-                message.from_user.id, eng, rus
+            await db.execute(
+                "INSERT INTO vocabulary (user_id, english, translation) VALUES(?, ?, ?)",
+                (message.from_user.id, eng, rus)
             )
+            await db.commit()
             await message.answer(f"*{eng}* — {rus}", reply_markup=ADD_KB)
         except Exception as e:
             print("DB insert error:", repr(e))
@@ -858,10 +874,11 @@ async def save_word_callback(callback: CallbackQuery, state: FSMContext):
     eng = data.get("pending_eng")
     rus = data.get("pending_rus")
     if eng and rus:
-        await pool.execute(  # type: ignore
-            "INSERT INTO vocabulary (user_id, english, translation) VALUES($1, $2, $3)",
-            callback.from_user.id, eng, rus
+        await db.execute(
+            "INSERT INTO vocabulary (user_id, english, translation) VALUES(?, ?, ?)",
+            (callback.from_user.id, eng, rus)
         )
+        await db.commit()
         await callback.message.edit_text(callback.message.text + "\n\n(сохранено)")
     else:
         await callback.message.edit_text("Нет данных для сохранения.")
@@ -886,10 +903,11 @@ async def cancel_word_callback(callback: CallbackQuery, state: FSMContext):
 @dp.message(StateFilter(default_state), F.text == BTN_DICT)
 async def show_dictionary(message: Message):
     try:
-        rows = await pool.fetch(  # type: ignore
-            "SELECT id, english, translation FROM vocabulary WHERE user_id = $1 ORDER BY added_at DESC LIMIT 50",
-            message.from_user.id
+        cursor = await db.execute(
+            "SELECT id, english, translation FROM vocabulary WHERE user_id = ? ORDER BY added_at DESC LIMIT 50",
+            (message.from_user.id,)
         )
+        rows = await cursor.fetchall()
     except Exception as e:
         print("DB select error:", repr(e))
         await message.answer("Ошибка загрузки словаря.")
@@ -937,13 +955,15 @@ async def process_delete_word(message: Message, state: FSMContext):
 
     if text.isdigit():
         idx = int(text) - 1
-        rows = await pool.fetch(  # type: ignore
-            "SELECT id, english, translation FROM vocabulary WHERE user_id = $1 ORDER BY added_at DESC LIMIT 50",
-            user_id
+        cursor = await db.execute(
+            "SELECT id, english, translation FROM vocabulary WHERE user_id = ? ORDER BY added_at DESC LIMIT 50",
+            (user_id,)
         )
+        rows = await cursor.fetchall()
         if 0 <= idx < len(rows):
             row = rows[idx]
-            await pool.execute("DELETE FROM vocabulary WHERE id = $1", row['id'])  # type: ignore
+            await db.execute("DELETE FROM vocabulary WHERE id = ?", (row['id'],))
+            await db.commit()
             await state.clear()
             await message.answer(f"Удалено: *{row['english']}* — {row['translation']}", reply_markup=MAIN_KB)
             return
@@ -951,12 +971,14 @@ async def process_delete_word(message: Message, state: FSMContext):
             await message.answer("Нет слова с таким номером.")
             return
 
-    row = await pool.fetchrow(  # type: ignore
-        "SELECT id, english, translation FROM vocabulary WHERE user_id = $1 AND (LOWER(english) = $2 OR LOWER(translation) = $2) LIMIT 1",
-        user_id, text.lower()
+    cursor = await db.execute(
+        "SELECT id, english, translation FROM vocabulary WHERE user_id = ? AND (LOWER(english) = ? OR LOWER(translation) = ?) LIMIT 1",
+        (user_id, text.lower(), text.lower())
     )
+    row = await cursor.fetchone()
     if row:
-        await pool.execute("DELETE FROM vocabulary WHERE id = $1", row['id'])  # type: ignore
+        await db.execute("DELETE FROM vocabulary WHERE id = ?", (row['id'],))
+        await db.commit()
         await state.clear()
         await message.answer(f"Удалено: *{row['english']}* — {row['translation']}", reply_markup=MAIN_KB)
     else:
@@ -978,16 +1000,17 @@ async def smart_learn_callback(callback: CallbackQuery, state: FSMContext):
 async def _start_smart_learn(chat_id: int, user_id: int, state: FSMContext):
     """Smart learn: SR words first, then random quiz."""
     # 1. Check for SR-due words
-    sr_rows = await pool.fetch(  # type: ignore
+    cursor = await db.execute(
         """
         SELECT id, english, translation, sr_interval, sr_ease
         FROM vocabulary
-        WHERE user_id = $1 AND sr_next_review <= now()
+        WHERE user_id = ? AND sr_next_review <= datetime('now')
         ORDER BY sr_next_review ASC
         LIMIT 10
         """,
-        user_id
+        (user_id,)
     )
+    sr_rows = await cursor.fetchall()
 
     if sr_rows:
         # Start flashcard mode
@@ -1014,10 +1037,11 @@ async def _start_smart_learn(chat_id: int, user_id: int, state: FSMContext):
         return
 
     # 2. No SR words — random quiz (5 words, mixed, quick)
-    rows = await pool.fetch(  # type: ignore
-        "SELECT id, english, translation FROM vocabulary WHERE user_id = $1 ORDER BY random() LIMIT 5",
-        user_id
+    cursor = await db.execute(
+        "SELECT id, english, translation FROM vocabulary WHERE user_id = ? ORDER BY random() LIMIT 5",
+        (user_id,)
     )
+    rows = await cursor.fetchall()
     if not rows:
         await bot.send_message(chat_id, "Словарь пуст. Добавь слова.", reply_markup=MAIN_KB)
         return
@@ -1097,10 +1121,11 @@ async def train_pick_type(message: Message, state: FSMContext):
     mode_key = data.get("mode", "mix")
     train_type = "input" if text == "ввод" else "quick"
 
-    rows = await pool.fetch(  # type: ignore
-        "SELECT id, english, translation FROM vocabulary WHERE user_id = $1 ORDER BY random() LIMIT $2",
-        message.from_user.id, count
+    cursor = await db.execute(
+        "SELECT id, english, translation FROM vocabulary WHERE user_id = ? ORDER BY random() LIMIT ?",
+        (message.from_user.id, count)
     )
+    rows = await cursor.fetchall()
     if not rows:
         await message.answer("Словарь пуст.", reply_markup=MAIN_KB)
         await state.clear()
@@ -1132,10 +1157,11 @@ async def _send_quick_quiz_question(chat_id: int, user_id: int, state: FSMContex
 
     col = "translation" if direction == "en_ru" else "english"
 
-    wrong_rows = await pool.fetch(  # type: ignore
-        f"SELECT {col} FROM vocabulary WHERE user_id = $1 AND {col} != $2 ORDER BY random() LIMIT 3",
-        user_id, correct_answer
+    cursor = await db.execute(
+        f"SELECT {col} FROM vocabulary WHERE user_id = ? AND {col} != ? ORDER BY random() LIMIT 3",
+        (user_id, correct_answer)
     )
+    wrong_rows = await cursor.fetchall()
     options = [correct_answer] + [r[col] for r in wrong_rows]
 
     # Pad with placeholder if not enough
@@ -1180,10 +1206,11 @@ async def quick_quiz_answer(callback: CallbackQuery, state: FSMContext):
 
     goal_msg = await update_streak_and_goal(user_id, is_correct)
 
-    await pool.execute(  # type: ignore
-        "INSERT INTO quiz_stats (user_id, word_id, is_correct, attempts_count) VALUES ($1,$2,$3,1)",
-        user_id, word_id, is_correct
+    await db.execute(
+        "INSERT INTO quiz_stats (user_id, word_id, is_correct, attempts_count) VALUES (?,?,?,1)",
+        (user_id, word_id, is_correct)
     )
+    await db.commit()
 
     idx += 1
     await state.update_data(idx=idx, score=score)
@@ -1256,10 +1283,11 @@ async def train_in_quiz(message: Message, state: FSMContext):
 
     goal_msg = await update_streak_and_goal(message.from_user.id, correct)
 
-    await pool.execute(  # type: ignore
-        "INSERT INTO quiz_stats (user_id, word_id, is_correct, attempts_count) VALUES ($1,$2,$3,1)",
-        message.from_user.id, word_id, correct
+    await db.execute(
+        "INSERT INTO quiz_stats (user_id, word_id, is_correct, attempts_count) VALUES (?,?,?,1)",
+        (message.from_user.id, word_id, correct)
     )
+    await db.commit()
 
     if correct:
         score += 1
@@ -1365,14 +1393,16 @@ async def _fc_process(callback: CallbackQuery, state: FSMContext, knew: bool):
             sr_ease = max(1.3, sr_ease * 0.8)
 
         try:
-            await pool.execute(  # type: ignore
+            next_review = (datetime.now() + timedelta(days=new_interval)).isoformat()
+            await db.execute(
                 """
                 UPDATE vocabulary
-                SET sr_interval = $2, sr_ease = $3, sr_next_review = now() + make_interval(days => $2)
-                WHERE id = $1
+                SET sr_interval = ?, sr_ease = ?, sr_next_review = ?
+                WHERE id = ?
                 """,
-                word_id, new_interval, sr_ease
+                (new_interval, sr_ease, next_review, word_id)
             )
+            await db.commit()
         except Exception as e:
             print(f"SR update error: {e}")
 
@@ -1413,15 +1443,17 @@ async def _fc_process(callback: CallbackQuery, state: FSMContext, knew: bool):
 
 @dp.message(StateFilter(default_state), F.text == "Пропустить")
 async def skip_auto_quiz(message: Message):
-    await pool.execute("DELETE FROM active_quizzes WHERE user_id = $1", message.from_user.id)  # type: ignore
+    await db.execute("DELETE FROM active_quizzes WHERE user_id = ?", (message.from_user.id,))
+    await db.commit()
     await message.answer("Пропущено.", reply_markup=MAIN_KB)
 
 @dp.message(F.voice)
 async def handle_voice_in_auto_quiz(message: Message):
-    active_quiz = await pool.fetchrow(  # type: ignore
-        "SELECT * FROM active_quizzes WHERE user_id = $1 ORDER BY id LIMIT 1",
-        message.from_user.id
+    cursor = await db.execute(
+        "SELECT * FROM active_quizzes WHERE user_id = ? ORDER BY id LIMIT 1",
+        (message.from_user.id,)
     )
+    active_quiz = await cursor.fetchone()
     if not active_quiz:
         return
 
@@ -1452,56 +1484,63 @@ async def process_auto_quiz_answer(message: Message, answer: str, quiz_data):
     is_correct, feedback = await judge_semantic(direction, question, expected, answer)
 
     if is_correct:
-        await pool.execute(  # type: ignore
-            "INSERT INTO quiz_stats (user_id, word_id, is_correct, attempts_count) VALUES ($1,$2,$3,$4)",
-            user_id, word_id, True, attempts + 1
+        await db.execute(
+            "INSERT INTO quiz_stats (user_id, word_id, is_correct, attempts_count) VALUES (?,?,?,?)",
+            (user_id, word_id, True, attempts + 1)
         )
-        await pool.execute("DELETE FROM active_quizzes WHERE id = $1", quiz_data['id'])  # type: ignore
+        await db.execute("DELETE FROM active_quizzes WHERE id = ?", (quiz_data['id'],))
+        await db.commit()
         await update_streak_and_goal(user_id, True)
         await message.answer("Верно" + (f"  {feedback}" if feedback else ""))
 
-        next_quiz = await pool.fetchrow(  # type: ignore
-            "SELECT * FROM active_quizzes WHERE user_id = $1 ORDER BY id LIMIT 1", user_id
+        cursor = await db.execute(
+            "SELECT * FROM active_quizzes WHERE user_id = ? ORDER BY id LIMIT 1", (user_id,)
         )
+        next_quiz = await cursor.fetchone()
         if next_quiz:
             await message.answer(next_quiz['question'])
         else:
-            stats = await pool.fetch(  # type: ignore
+            cursor = await db.execute(
                 """
                 SELECT COUNT(*) as total, SUM(CASE WHEN is_correct THEN 1 ELSE 0 END) as correct
-                FROM quiz_stats WHERE user_id = $1 AND answered_at > NOW() - INTERVAL '1 hour'
-                """, user_id
+                FROM quiz_stats WHERE user_id = ? AND answered_at > datetime('now', '-1 hour')
+                """, (user_id,)
             )
+            stats = await cursor.fetchall()
             total = stats[0]['total'] if stats else 0
             correct = stats[0]['correct'] if stats else 0
             await message.answer(f"Квиз завершен\n\nРезультат: {correct}/{total}", reply_markup=MAIN_KB)
     else:
         attempts += 1
-        await pool.execute(  # type: ignore
-            "UPDATE active_quizzes SET attempts = $1 WHERE id = $2", attempts, quiz_data['id']
+        await db.execute(
+            "UPDATE active_quizzes SET attempts = ? WHERE id = ?", (attempts, quiz_data['id'])
         )
+        await db.commit()
         await update_streak_and_goal(user_id, False)
 
         if attempts >= 3:
-            await pool.execute(  # type: ignore
-                "INSERT INTO quiz_stats (user_id, word_id, is_correct, attempts_count) VALUES ($1,$2,$3,$4)",
-                user_id, word_id, False, attempts
+            await db.execute(
+                "INSERT INTO quiz_stats (user_id, word_id, is_correct, attempts_count) VALUES (?,?,?,?)",
+                (user_id, word_id, False, attempts)
             )
-            await pool.execute("DELETE FROM active_quizzes WHERE id = $1", quiz_data['id'])  # type: ignore
+            await db.execute("DELETE FROM active_quizzes WHERE id = ?", (quiz_data['id'],))
+            await db.commit()
             await message.answer(f"Неверно — *{expected}*" + (f"\n{feedback}" if feedback else ""))
 
-            next_quiz = await pool.fetchrow(  # type: ignore
-                "SELECT * FROM active_quizzes WHERE user_id = $1 ORDER BY id LIMIT 1", user_id
+            cursor = await db.execute(
+                "SELECT * FROM active_quizzes WHERE user_id = ? ORDER BY id LIMIT 1", (user_id,)
             )
+            next_quiz = await cursor.fetchone()
             if next_quiz:
                 await message.answer(next_quiz['question'])
             else:
-                stats = await pool.fetch(  # type: ignore
+                cursor = await db.execute(
                     """
                     SELECT COUNT(*) as total, SUM(CASE WHEN is_correct THEN 1 ELSE 0 END) as correct
-                    FROM quiz_stats WHERE user_id = $1 AND answered_at > NOW() - INTERVAL '1 hour'
-                    """, user_id
+                    FROM quiz_stats WHERE user_id = ? AND answered_at > datetime('now', '-1 hour')
+                    """, (user_id,)
                 )
+                stats = await cursor.fetchall()
                 total = stats[0]['total'] if stats else 0
                 correct = stats[0]['correct'] if stats else 0
                 await message.answer(f"Квиз завершен\n\nРезультат: {correct}/{total}", reply_markup=MAIN_KB)
@@ -1520,9 +1559,10 @@ async def show_settings(message: Message, state: FSMContext):
 async def _show_settings_menu(message: Message, state: FSMContext):
     user_id = message.from_user.id
     await ensure_user_settings(user_id)
-    settings = await pool.fetchrow(  # type: ignore
-        "SELECT * FROM user_settings WHERE user_id = $1", user_id
+    cursor = await db.execute(
+        "SELECT * FROM user_settings WHERE user_id = ?", (user_id,)
     )
+    settings = await cursor.fetchone()
 
     status = "вкл" if settings['quiz_enabled'] else "выкл"
     times = settings['quiz_times']
@@ -1549,14 +1589,16 @@ async def _show_settings_menu(message: Message, state: FSMContext):
 @dp.message(SettingsMenu.main, F.text == "Уведомления вкл/выкл")
 async def toggle_notifications(message: Message, state: FSMContext):
     await ensure_user_settings(message.from_user.id)
-    current = await pool.fetchrow(  # type: ignore
-        "SELECT quiz_enabled FROM user_settings WHERE user_id = $1", message.from_user.id
+    cursor = await db.execute(
+        "SELECT quiz_enabled FROM user_settings WHERE user_id = ?", (message.from_user.id,)
     )
+    current = await cursor.fetchone()
     new_status = not current['quiz_enabled'] if current else True
-    await pool.execute(  # type: ignore
-        "UPDATE user_settings SET quiz_enabled = $2 WHERE user_id = $1",
-        message.from_user.id, new_status
+    await db.execute(
+        "UPDATE user_settings SET quiz_enabled = ? WHERE user_id = ?",
+        (new_status, message.from_user.id)
     )
+    await db.commit()
     await message.answer(f"Автоквизы: {'вкл' if new_status else 'выкл'}")
     await _show_settings_menu(message, state)
 
@@ -1583,10 +1625,11 @@ async def change_quiz_count_process(message: Message, state: FSMContext):
         await message.answer("Выбери: 3, 5, 10, 15 или 20.")
         return
     count = int(text)
-    await pool.execute(  # type: ignore
-        "UPDATE user_settings SET quiz_count = $2 WHERE user_id = $1",
-        message.from_user.id, count
+    await db.execute(
+        "UPDATE user_settings SET quiz_count = ? WHERE user_id = ?",
+        (count, message.from_user.id)
     )
+    await db.commit()
     await message.answer(f"Установлено: {count}")
     await _show_settings_menu(message, state)
 
@@ -1613,10 +1656,11 @@ async def change_daily_goal_process(message: Message, state: FSMContext):
         await message.answer("Выбери: 3, 5, 10, 15 или 20.")
         return
     goal = int(text)
-    await pool.execute(  # type: ignore
-        "UPDATE user_settings SET daily_goal = $2 WHERE user_id = $1",
-        message.from_user.id, goal
+    await db.execute(
+        "UPDATE user_settings SET daily_goal = ? WHERE user_id = ?",
+        (goal, message.from_user.id)
     )
+    await db.commit()
     await message.answer(f"Цель дня: {goal}")
     await _show_settings_menu(message, state)
 
@@ -1643,13 +1687,16 @@ async def show_statistics(message: Message):
     user_id = message.from_user.id
     await ensure_user_settings(user_id)
 
-    total_words = await pool.fetchval(  # type: ignore
-        "SELECT COUNT(*) FROM vocabulary WHERE user_id = $1", user_id
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM vocabulary WHERE user_id = ?", (user_id,)
     )
+    row = await cursor.fetchone()
+    total_words = row[0] if row else 0
 
-    settings = await pool.fetchrow(  # type: ignore
-        "SELECT streak, total_correct, daily_goal, today_answers, last_practice_date FROM user_settings WHERE user_id = $1", user_id
+    cursor = await db.execute(
+        "SELECT streak, total_correct, daily_goal, today_answers, last_practice_date FROM user_settings WHERE user_id = ?", (user_id,)
     )
+    settings = await cursor.fetchone()
     streak = settings['streak'] or 0
     total_correct = settings['total_correct'] or 0
     daily_goal = settings['daily_goal'] or 5
@@ -1657,39 +1704,43 @@ async def show_statistics(message: Message):
     last_date = settings['last_practice_date']
 
     # Reset today_answers display if not today
-    if last_date != date.today():
+    if last_date != date.today().isoformat():
         today_answers = 0
 
     rank_name, next_threshold = get_rank(total_correct)
 
-    due_count = await pool.fetchval(  # type: ignore
-        "SELECT COUNT(*) FROM vocabulary WHERE user_id = $1 AND sr_next_review <= now()", user_id
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM vocabulary WHERE user_id = ? AND sr_next_review <= datetime('now')", (user_id,)
     )
+    row = await cursor.fetchone()
+    due_count = row[0] if row else 0
 
-    quiz_stats = await pool.fetchrow(  # type: ignore
+    cursor = await db.execute(
         """
         SELECT COUNT(*) as total_attempts,
                SUM(CASE WHEN is_correct THEN 1 ELSE 0 END) as correct_answers
         FROM quiz_stats
-        WHERE user_id = $1 AND answered_at > NOW() - INTERVAL '7 days'
-        """, user_id
+        WHERE user_id = ? AND answered_at > datetime('now', '-7 days')
+        """, (user_id,)
     )
+    quiz_stats = await cursor.fetchone()
     total_attempts = quiz_stats['total_attempts'] if quiz_stats else 0
     correct_7d = quiz_stats['correct_answers'] if quiz_stats else 0
     accuracy = (correct_7d / total_attempts * 100) if total_attempts > 0 else 0
 
-    weekly_rows = await pool.fetch(  # type: ignore
+    cursor = await db.execute(
         """
         SELECT
-            date_trunc('week', answered_at) as week,
+            strftime('%Y-%W', answered_at) as week,
             COUNT(*) as total,
             SUM(CASE WHEN is_correct THEN 1 ELSE 0 END) as correct
         FROM quiz_stats
-        WHERE user_id = $1 AND answered_at > NOW() - INTERVAL '28 days'
+        WHERE user_id = ? AND answered_at > datetime('now', '-28 days')
         GROUP BY week
         ORDER BY week ASC
-        """, user_id
+        """, (user_id,)
     )
+    weekly_rows = await cursor.fetchall()
 
     weekly_lines = []
     for row in weekly_rows:
@@ -1749,10 +1800,11 @@ async def menu_from_any_state(message: Message, state: FSMContext):
 async def chat_with_ai(message: Message):
     text = (message.text or "").strip()
 
-    active_quiz = await pool.fetchrow(  # type: ignore
-        "SELECT * FROM active_quizzes WHERE user_id = $1 ORDER BY id LIMIT 1",
-        message.from_user.id
+    cursor = await db.execute(
+        "SELECT * FROM active_quizzes WHERE user_id = ? ORDER BY id LIMIT 1",
+        (message.from_user.id,)
     )
+    active_quiz = await cursor.fetchone()
     if active_quiz and text:
         await process_auto_quiz_answer(message, text, active_quiz)
         return
@@ -1822,91 +1874,82 @@ async def chat_with_ai(message: Message):
 # =====================================================================
 
 async def init_db():
-    global pool
-    pool = await asyncpg.create_pool(DATABASE_URL)
+    global db
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    await db.execute("PRAGMA foreign_keys = ON")
+    await db.execute("PRAGMA journal_mode = WAL")
 
-    await pool.execute("""
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS vocabulary (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             english TEXT,
             translation TEXT,
-            added_at TIMESTAMP DEFAULT now(),
+            added_at TEXT DEFAULT (datetime('now')),
             sr_interval INTEGER DEFAULT 0,
             sr_ease REAL DEFAULT 2.5,
-            sr_next_review TIMESTAMP DEFAULT now()
+            sr_next_review TEXT DEFAULT (datetime('now'))
         );
     """)
 
-    await pool.execute("""
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
-            user_id BIGINT PRIMARY KEY,
-            quiz_enabled BOOLEAN DEFAULT true,
+            user_id INTEGER PRIMARY KEY,
+            quiz_enabled INTEGER DEFAULT 1,
             quiz_times TEXT DEFAULT '10:00,14:00,18:00',
             quiz_count INTEGER DEFAULT 5,
-            created_at TIMESTAMP DEFAULT now(),
+            created_at TEXT DEFAULT (datetime('now')),
             streak INTEGER DEFAULT 0,
-            last_practice_date DATE,
+            last_practice_date TEXT,
             total_correct INTEGER DEFAULT 0,
             daily_goal INTEGER DEFAULT 5,
             today_answers INTEGER DEFAULT 0
         );
     """)
 
-    await pool.execute("""
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS quiz_stats (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             word_id INTEGER REFERENCES vocabulary(id) ON DELETE CASCADE,
-            is_correct BOOLEAN,
+            is_correct INTEGER,
             attempts_count INTEGER DEFAULT 1,
-            answered_at TIMESTAMP DEFAULT now()
+            answered_at TEXT DEFAULT (datetime('now'))
         );
     """)
 
-    await pool.execute("""
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS active_quizzes (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             question TEXT,
             expected_answer TEXT,
             direction TEXT,
             word_id INTEGER REFERENCES vocabulary(id) ON DELETE CASCADE,
             attempts INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT now()
+            created_at TEXT DEFAULT (datetime('now'))
         );
     """)
 
     # Safe migration for existing tables
-    await pool.execute("""
-        DO $$
-        BEGIN
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='vocabulary' AND column_name='sr_interval') THEN
-                ALTER TABLE vocabulary ADD COLUMN sr_interval INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='vocabulary' AND column_name='sr_ease') THEN
-                ALTER TABLE vocabulary ADD COLUMN sr_ease REAL DEFAULT 2.5;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='vocabulary' AND column_name='sr_next_review') THEN
-                ALTER TABLE vocabulary ADD COLUMN sr_next_review TIMESTAMP DEFAULT now();
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='user_settings' AND column_name='streak') THEN
-                ALTER TABLE user_settings ADD COLUMN streak INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='user_settings' AND column_name='last_practice_date') THEN
-                ALTER TABLE user_settings ADD COLUMN last_practice_date DATE;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='user_settings' AND column_name='total_correct') THEN
-                ALTER TABLE user_settings ADD COLUMN total_correct INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='user_settings' AND column_name='daily_goal') THEN
-                ALTER TABLE user_settings ADD COLUMN daily_goal INTEGER DEFAULT 5;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='user_settings' AND column_name='today_answers') THEN
-                ALTER TABLE user_settings ADD COLUMN today_answers INTEGER DEFAULT 0;
-            END IF;
-        END $$;
-    """)
+    migrations = [
+        "ALTER TABLE vocabulary ADD COLUMN sr_interval INTEGER DEFAULT 0",
+        "ALTER TABLE vocabulary ADD COLUMN sr_ease REAL DEFAULT 2.5",
+        "ALTER TABLE vocabulary ADD COLUMN sr_next_review TEXT DEFAULT (datetime('now'))",
+        "ALTER TABLE user_settings ADD COLUMN streak INTEGER DEFAULT 0",
+        "ALTER TABLE user_settings ADD COLUMN last_practice_date TEXT",
+        "ALTER TABLE user_settings ADD COLUMN total_correct INTEGER DEFAULT 0",
+        "ALTER TABLE user_settings ADD COLUMN daily_goal INTEGER DEFAULT 5",
+        "ALTER TABLE user_settings ADD COLUMN today_answers INTEGER DEFAULT 0",
+    ]
+    for migration in migrations:
+        try:
+            await db.execute(migration)
+        except Exception:
+            pass  # Column already exists
+
+    await db.commit()
 
 # =====================================================================
 #  Main
@@ -1921,8 +1964,8 @@ async def main():
         await dp.start_polling(bot)
     finally:
         scheduler.shutdown()
-        if pool:
-            await pool.close()
+        if db:
+            await db.close()
 
 if __name__ == "__main__":
     try:
